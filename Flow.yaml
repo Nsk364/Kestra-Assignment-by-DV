@@ -391,9 +391,10 @@ triggers:
     protocol: IMAP
     host: "imap.gmail.com"
     port: 993
-    username: "nipunsaikokonda@gmail.com"
-    password: "uiohormhfunlcsmm"
+    username: #mail id 
+    password: #app password 
     folder: "INBOX"
     ssl: true
     interval: "PT1M"
+
 disabled: false
