@@ -287,16 +287,6 @@ subject,from,date,categories,summary
 "Sale: 50% Off","promo@shop.com","2025-01-09",...
 ```
 
-### Step 3: Download the JSON Files
-
-To save the outputs:
-
-1. In the Executions tab, look for tasks **"write_summary"** and **"write_urgent"**
-2. Click on each task
-3. Look for **"Download"** button next to the output
-
-Or check Kestra's internal storage folder (usually in Docker volume `kestra-data`).
-
 ---
 
 ## WhatsApp Alerts Feature
