@@ -1,0 +1,399 @@
+id: email_flow
+namespace: nipun.email
+description: "Email categorization + AI summary + urgent extraction workflow with WhatsApp alerts, spam detection, 14 categories, and CSV report."
+
+inputs:
+  - id: mode
+    type: STRING
+    defaults: "manual"
+    description: "manual or event"
+
+  - id: days
+    type: INT
+    defaults: 1
+    description: "How many days of emails to scan (manual mode only)"
+
+  - id: summary_word_limit
+    type: INT
+    defaults: 20
+    description: "Word limit for AI summaries (Gemini LLM)"
+
+tasks:
+  - id: process_emails
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Fetch, categorize, summarize, spam-check, and build JSON outputs."
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    dependencies:
+      - kestra
+      - requests
+    script: |
+      from kestra import Kestra
+      import imaplib
+      import email as email_mod
+      from email.header import decode_header
+      import os, ssl, json, requests, re
+      from datetime import datetime, timedelta
+      from collections import Counter
+      from email.utils import parsedate_to_datetime
+
+      mode = "{{ inputs.mode }}"
+      days = {{ inputs.days }}
+      limit = {{ inputs.summary_word_limit }}
+
+      host = os.getenv("EMAIL_HOST")
+      port = int(os.getenv("EMAIL_PORT", "993"))
+      user = os.getenv("EMAIL_USER")
+      password = os.getenv("EMAIL_PASSWORD")
+      api_key = os.getenv("AI_API_KEY")
+
+      ctx = ssl.create_default_context()
+      mail = imaplib.IMAP4_SSL(host, port, ssl_context=ctx)
+      mail.login(user, password)
+      mail.select("INBOX")
+
+      now = datetime.utcnow()
+      since_date = now - timedelta(days=days if mode == "manual" else 1)
+      since_str = since_date.strftime("%d-%b-%Y")
+
+      status, data = mail.search(None, f'(SINCE "{since_str}")')
+      ids = data[0].split() if status == "OK" else []
+
+      categories = {
+          "sports": [
+              "cricket", "football", "tennis", "match", "tournament", "game", "league"
+          ],
+          "news": [
+              "news", "update", "headline", "breaking", "announcement", "newsletter", "report"
+          ],
+          "promotions": [
+              "offer", "discount", "sale", "deal", "promotion", "coupon", "cashback"
+          ],
+          "urgent": [
+              "urgent", "asap", "immediately", "deadline", "reminder", "overdue", "critical"
+          ],
+          "jobs": [
+              "interview", "opening", "hiring", "job", "career", "placement", "internship"
+          ],
+          "finance": [
+              "payment", "invoice", "bank", "statement", "transaction", "salary", "loan"
+          ],
+          "spam": [
+              "lottery", "win money", "prize", "crypto", "click here", "100% free", "get rich"
+          ],
+          "events_meetings": [
+              "event", "meeting", "webinar", "conference", "workshop", "session", "invitation"
+          ],
+          "education_academics": [
+              "exam", "assignment", "project", "result", "class", "lecture", "grades"
+          ],
+          "travel": [
+              "flight", "train", "bus", "ticket", "hotel", "reservation", "trip"
+          ],
+          "shopping_ecommerce": [
+              "order", "shipment", "delivery", "package", "tracking", "amazon", "flipkart"
+          ],
+          "bills_utilities": [
+              "bill", "utility", "electricity", "water", "phone", "recharge", "invoice"
+          ],
+          "personal": [
+              "family", "friend", "birthday", "anniversary", "greetings", "wishes", "celebration"
+          ],
+          "health_medical": [
+              "appointment", "doctor", "hospital", "medicine", "lab", "report", "clinic"
+          ],
+      }
+
+      def decode_hdr(val):
+          parts = decode_header(val or "")
+          s = ""
+          for p, enc in parts:
+              if isinstance(p, bytes):
+                  s += p.decode(enc or "utf-8", errors="ignore")
+              else:
+                  s += p
+          return s
+
+      def get_body(msg):
+          if msg.is_multipart():
+              for part in msg.walk():
+                  if part.get_content_type() == "text/plain":
+                      try:
+                          return part.get_payload(decode=True).decode(errors="ignore")
+                      except:
+                          continue
+          else:
+              try:
+                  return msg.get_payload(decode=True).decode(errors="ignore")
+              except:
+                  return ""
+          return ""
+
+      def classify(text):
+          t = text.lower()
+          out = []
+          for cat, words in categories.items():
+              if any(w in t for w in words):
+                  out.append(cat)
+          return out or ["other"]
+
+      def summarize(text):
+          if not api_key:
+              return "No AI_API_KEY configured."
+
+          prompt = f"Summarize this email in {limit} words:\n{text}"
+          url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+          headers = {"Content-Type": "application/json"}
+          payload = {"contents": [{"parts": [{"text": prompt}]}]}
+
+          try:
+              r = requests.post(url + f"?key={api_key}", json=payload, timeout=30)
+              r.raise_for_status()
+              data = r.json()
+              return data["candidates"][0]["content"]["parts"][0]["text"]
+          except Exception as e:
+              return f"Summary failed: {e}"
+
+      def classify_spam_ai(text):
+          if not api_key:
+              return {"is_spam": False, "reason": "No API key"}
+
+          prompt = (
+              "You are a spam filter. "
+              "Return STRICT JSON with keys is_spam (true/false) and reason.\n\n"
+              f"EMAIL:\n{text}"
+          )
+
+          url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+          headers = {"Content-Type": "application/json"}
+          payload = {"contents": [{"parts": [{"text": prompt}]}]}
+
+          try:
+              r = requests.post(url + f"?key={api_key}", json=payload, timeout=30)
+              r.raise_for_status()
+              out = r.json()
+              txt = out["candidates"][0]["content"]["parts"][0]["text"]
+              return json.loads(txt)
+          except:
+              return {"is_spam": False, "reason": "AI parse error"}
+
+      emails = []
+      urgent_clean = []
+
+      for eid in ids:
+          _, raw = mail.fetch(eid, "(RFC822)")
+          msg = email_mod.message_from_bytes(raw[0][1])
+
+          subject = decode_hdr(msg.get("Subject"))
+          sender = msg.get("From", "")
+          date_ = msg.get("Date", "")
+          body = get_body(msg)
+          full = subject + "\n" + body
+
+          cats = classify(full)
+          is_spam_rule = "spam" in cats
+          spam_ai = classify_spam_ai(full)
+          is_spam_ai = spam_ai.get("is_spam", False)
+          spam_reason = spam_ai.get("reason")
+          summ = summarize(full)
+
+          obj = {
+              "subject": subject,
+              "from": sender,
+              "date": date_,
+              "categories": cats,
+              "is_spam_rule": is_spam_rule,
+              "is_spam_ai": is_spam_ai,
+              "spam_reason": spam_reason,
+              "summary": summ,
+          }
+
+          emails.append(obj)
+
+          if "urgent" in cats and not is_spam_rule and not is_spam_ai:
+              urgent_clean.append(obj)
+
+      def sort_by_date(email_obj):
+          try:
+              return parsedate_to_datetime(email_obj["date"])
+          except Exception:
+              return datetime.min
+
+      urgent_clean = sorted(urgent_clean, key=sort_by_date, reverse=True)
+
+      cat_counts = Counter()
+      sender_counts = Counter()
+      for e in emails:
+          for c in e["categories"]:
+              cat_counts[c] += 1
+          sender_counts[e["from"]] += 1
+
+      summary = {
+          "mode": mode,
+          "emails_scanned": len(emails),
+          "counts_by_category": dict(cat_counts),
+          "counts_by_sender": dict(sender_counts),
+          "emails": emails,
+          "urgent_emails": urgent_clean,
+      }
+
+      urgent_summary = {
+          "urgent_count": len(urgent_clean),
+          "urgent_emails": urgent_clean,
+      }
+
+      Kestra.outputs({
+          "summary_json": json.dumps(summary),
+          "urgent_json": json.dumps(urgent_summary),
+      })
+
+      print(json.dumps(summary))
+
+  - id: write_summary
+    type: io.kestra.plugin.core.storage.Write
+    description: "Write all results as JSON."
+    content: "{{ outputs.process_emails.vars.summary_json }}"
+    extension: ".json"
+
+  - id: write_urgent
+    type: io.kestra.plugin.core.storage.Write
+    description: "Write urgent emails JSON."
+    content: "{{ outputs.process_emails.vars.urgent_json }}"
+    extension: ".json"
+
+  - id: generate_csv_report
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Export emails as CSV."
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    dependencies:
+      - pandas
+    inputFiles:
+      summary.json: "{{ outputs.process_emails.vars.summary_json }}"
+    outputFiles:
+      - "email_report.csv"
+    script: |
+      import json
+      import pandas as pd
+
+      with open("summary.json") as f:
+          data = json.load(f)
+
+      df = pd.DataFrame(data.get("emails", []))
+
+      if "categories" in df.columns:
+          df["categories"] = df["categories"].apply(
+              lambda x: ", ".join(x) if isinstance(x, list) else x
+          )
+
+      df.to_csv("email_report.csv", index=False)
+
+  - id: send_whatsapp_alert
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Send WhatsApp alert for new urgent emails."
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    dependencies:
+      - requests
+    inputFiles:
+      urgent.json: "{{ outputs.process_emails.vars.urgent_json }}"
+    script: |
+      import json, os, re, requests
+
+      with open("urgent.json") as f:
+          urgent_summary = json.load(f)
+
+      urgent_list = urgent_summary.get("urgent_emails", []) or []
+
+      if not urgent_list:
+          print("No urgent emails -> skipping WhatsApp alert.")
+          raise SystemExit(0)
+
+      tw_sid = os.getenv("TWILIO_ACCOUNT_SID")
+      tw_token = os.getenv("TWILIO_AUTH_TOKEN")
+      tw_from = os.getenv("TWILIO_FROM_WHATSAPP")
+      tw_to = os.getenv("TWILIO_TO_WHATSAPP")
+
+      if not all([tw_sid, tw_token, tw_from, tw_to]):
+          print("Twilio not configured -> skipping WhatsApp alert.")
+          raise SystemExit(0)
+
+      ALERT_FILE = "/tmp/alerted_urgent_ids.json"
+
+      try:
+          with open(ALERT_FILE, "r") as f:
+              alerted_ids = set(json.load(f))
+      except Exception:
+          alerted_ids = set()
+
+      def extract_email(from_field):
+          match = re.search(r'<([^>]+)>', from_field)
+          return match.group(1) if match else from_field
+
+      def make_id(e):
+          return (e.get("subject", "").strip() + "|" + e.get("date", "").strip())
+
+      new_urgent = [e for e in urgent_list if make_id(e) not in alerted_ids]
+
+      if not new_urgent:
+          print("No new urgent emails -> skipping WhatsApp alert.")
+          raise SystemExit(0)
+
+      count = len(new_urgent)
+      lines = []
+
+      latest = new_urgent[0]
+      latest_subj = latest["subject"].strip().replace("\n", " ")
+      latest_sender = extract_email(latest["from"])
+      lines.append(f"🚨 New Urgent: {latest_subj} ({latest_sender})")
+
+      if count > 1:
+          lines.append("")
+          lines.append("Other new urgents:")
+          for idx, e in enumerate(new_urgent[1:3], start=2):
+              subj = e["subject"].strip().replace("\n", " ")
+              sender = extract_email(e["from"])
+              lines.append(f"{idx}. {subj} ({sender})")
+          if count > 3:
+              lines.append(f"...and {count - 3} more!")
+
+      lines.append("")
+      lines.append("Open your inbox to review.")
+
+      body = "\n".join(lines)
+
+      url = f"https://api.twilio.com/2010-04-01/Accounts/{tw_sid}/Messages.json"
+      data = {
+          "From": tw_from,
+          "To": tw_to,
+          "Body": body,
+      }
+
+      try:
+          r = requests.post(url, data=data, auth=(tw_sid, tw_token), timeout=10)
+          r.raise_for_status()
+          print("WhatsApp alert sent successfully!")
+      except Exception as e:
+          print(f"WhatsApp alert failed: {e}")
+
+      for e in new_urgent:
+          alerted_ids.add(make_id(e))
+
+      try:
+          with open(ALERT_FILE, "w") as f:
+              json.dump(list(alerted_ids), f)
+      except Exception as e:
+          print(f"Failed to persist alert cache: {e}")
+
+triggers:
+  - id: gmail_new_email
+    type: io.kestra.plugin.notifications.mail.MailReceivedTrigger
+    protocol: IMAP
+    host: "imap.gmail.com"
+    port: 993
+    username: "nipunsaikokonda@gmail.com"
+    password: "uiohormhfunlcsmm"
+    folder: "INBOX"
+    ssl: true
+    interval: "PT1M"
+disabled: false
