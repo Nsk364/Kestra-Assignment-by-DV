@@ -13,7 +13,8 @@ services:
     volumes:
       - kestra-data:/app/storage
     env_file:
-      - .env     # <---- add this line
+      - .env     
 
 volumes:
   kestra-data:
+
