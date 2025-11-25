@@ -142,9 +142,11 @@ tasks:
               return "No AI_API_KEY configured."
 
           prompt = f"Summarize this email in {limit} words:\n{text}"
-          url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+          url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent"
           headers = {"Content-Type": "application/json"}
-          payload = {"contents": [{"parts": [{"text": prompt}]}]}
+          payload = {
+              "contents": [{"parts": [{"text": prompt}]}]
+          }
 
           try:
               r = requests.post(url + f"?key={api_key}", json=payload, timeout=30)
@@ -159,23 +161,48 @@ tasks:
               return {"is_spam": False, "reason": "No API key"}
 
           prompt = (
-              "You are a spam filter. "
-              "Return STRICT JSON with keys is_spam (true/false) and reason.\n\n"
+              "You are an email spam filter.\n"
+              "Decide if the email is spam or not spam.\n"
+              "Reply ONLY as JSON, no markdown, no extra text.\n"
+              'Use exactly this schema: {\"is_spam\": true/false, \"reason\": \"<short explanation>\"}.\n\n'
               f"EMAIL:\n{text}"
           )
 
-          url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+          url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent"
           headers = {"Content-Type": "application/json"}
-          payload = {"contents": [{"parts": [{"text": prompt}]}]}
+          payload = {
+              "contents": [{"parts": [{"text": prompt}]}],
+              "generationConfig": {
+                  "responseMimeType": "application/json"
+              },
+          }
 
           try:
               r = requests.post(url + f"?key={api_key}", json=payload, timeout=30)
               r.raise_for_status()
               out = r.json()
               txt = out["candidates"][0]["content"]["parts"][0]["text"]
-              return json.loads(txt)
-          except:
-              return {"is_spam": False, "reason": "AI parse error"}
+              txt = txt.strip()
+
+              if txt.startswith("```"):
+                  txt = txt.strip("`")
+                  if txt.lower().startswith("json"):
+                      txt = txt[4:].strip()
+
+              if "{" in txt and "}" in txt:
+                  txt = txt[txt.find("{"): txt.rfind("}") + 1]
+
+              data = json.loads(txt)
+              if "is_spam" not in data:
+                  data["is_spam"] = False
+              if "reason" not in data:
+                  data["reason"] = "No reason provided"
+              return data
+          except Exception as e:
+              return {
+                  "is_spam": False,
+                  "reason": f"AI parse error: {e}"
+              }
 
       emails = []
       urgent_clean = []
@@ -391,10 +418,9 @@ triggers:
     protocol: IMAP
     host: "imap.gmail.com"
     port: 993
-    username: #mail id 
-    password: #app password 
+    username: #"Your Mail Id"
+    password: #"App PWD"
     folder: "INBOX"
     ssl: true
     interval: "PT1M"
-
 disabled: false
